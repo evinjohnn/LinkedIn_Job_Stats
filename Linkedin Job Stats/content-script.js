@@ -8,80 +8,92 @@
     let debounceTimer = null;
     
     // Cache system for job stats
-    const jobStatsCache = new Map();
     const CACHE_TTL = 5 * 60 * 1000; // 5 minutes TTL
     const DEBOUNCE_DELAY = 300; // 300ms debounce
     
-    // LRU Cache with TTL
-    class JobStatsCache {
-        constructor(maxSize = 50, ttl = CACHE_TTL) {
-            this.cache = new Map();
-            this.maxSize = maxSize;
-            this.ttl = ttl;
-        }
-        
-        get(jobId) {
-            const entry = this.cache.get(jobId);
-            if (!entry) return null;
-            
-            if (Date.now() - entry.timestamp > this.ttl) {
-                this.cache.delete(jobId);
-                return null;
+    // Simple in-memory cache
+    const jobCache = new Map();
+    
+    // Shared global object for communication
+    if (!window.linkedInJobStatsManager) {
+        console.log('🔧 Content script: Creating shared manager...');
+        window.linkedInJobStatsManager = {
+            stats: [],
+            listeners: [],
+            addStats: function(stats) {
+                console.log('📊 Content script: Adding stats to shared manager:', stats.jobId);
+                this.stats.push(stats);
+                // Keep only last 50 entries
+                if (this.stats.length > 50) {
+                    this.stats = this.stats.slice(-50);
+                }
+                // Notify listeners
+                this.listeners.forEach(callback => callback(stats));
+                console.log('📊 Content script: Shared manager now has', this.stats.length, 'stats');
+            },
+            addListener: function(callback) {
+                console.log('👂 Content script: Adding listener to shared manager');
+                this.listeners.push(callback);
+            },
+            getStatsForJob: function(jobId) {
+                const stats = this.stats.filter(s => s.jobId === jobId).pop();
+                console.log('🔍 Content script: Looking for job', jobId, 'in shared manager:', stats ? 'found' : 'not found');
+                return stats;
+            },
+            getLatestStats: function() {
+                return this.stats[this.stats.length - 1];
             }
-            
-            // Refresh LRU position
-            this.cache.delete(jobId);
-            this.cache.set(jobId, entry);
-            return entry.stats;
-        }
-        
-        set(jobId, stats) {
-            if (this.cache.has(jobId)) {
-                this.cache.delete(jobId);
-            } else if (this.cache.size >= this.maxSize) {
-                // Evict oldest entry (LRU)
-                const oldestKey = this.cache.keys().next().value;
-                this.cache.delete(oldestKey);
-            }
-            
-            this.cache.set(jobId, { stats, timestamp: Date.now() });
-        }
-        
-        clear() {
-            this.cache.clear();
-        }
+        };
+    } else {
+        console.log('🔧 Content script: Shared manager already exists');
     }
     
-    const cache = new JobStatsCache();
-    
-    // Listen for job stats from interceptor (custom event)
-    document.addEventListener('LinkedInJobStatsData', function(event) {
-        if (event.detail && event.detail.type === 'LINKEDIN_JOB_API_DATA') {
-            console.log('📡 Received job stats via custom event:', event.detail);
-            handleJobStats(event.detail);
-        }
+    // Always add our listener to the shared manager
+    console.log('👂 Content script: Adding listener to shared manager');
+    window.linkedInJobStatsManager.addListener(function(stats) {
+        console.log('📡 Received stats via shared manager:', stats);
+        handleJobStats(stats);
     });
     
-    // Listen for job stats from interceptor (postMessage)
-    window.addEventListener('message', function(event) {
-        if (event.source === window && event.data && 
-            event.data.type === 'LINKEDIN_JOB_STATS_FROM_INTERCEPTOR') {
-            console.log('📡 Received job stats via postMessage:', event.data.data);
-            handleJobStats(event.data.data);
+    // Simple fallback check every 5 seconds (much less aggressive)
+    setInterval(() => {
+        if (currentJobId && !lastStats) {
+            console.log('🔍 Fallback: Checking for stats for current job:', currentJobId);
+            const currentJobStats = window.linkedInJobStatsManager.getStatsForJob(currentJobId);
+            if (currentJobStats) {
+                console.log('🔄 Fallback: Found stats for current job:', currentJobId);
+                handleJobStats(currentJobStats);
+            }
         }
-    });
+    }, 5000); // Check every 5 seconds only if we don't have stats
     
     function handleJobStats(statsData) {
+        console.log('📥 Handling job stats for job:', statsData.jobId);
+        
+        // Cache the stats
+        jobCache.set(statsData.jobId, {
+            stats: statsData,
+            timestamp: Date.now()
+        });
+        
         lastStats = statsData;
         updateUI(statsData);
         
-        // Store in Chrome storage for popup access
-        chrome.runtime.sendMessage({
-            type: 'STORE_JOB_STATS',
-            data: statsData
-        }).catch(error => {
-            console.log('Could not send to background script:', error);
-        });
+        console.log('💾 Cached job stats. Cache size:', jobCache.size);
+        
+        // Try to store in Chrome storage for popup access (optional)
+        try {
+            chrome.runtime.sendMessage({
+                type: 'STORE_JOB_STATS',
+                data: statsData
+            }).catch(error => {
+                // Silently ignore background script errors
+                console.debug('Background script not available:', error.message);
+            });
+        } catch (error) {
+            // Silently ignore if chrome API is not available
+            console.debug('Chrome API not available');
+        }
     }
     
     // Extract current job ID from page
@@ -198,15 +210,32 @@
         },
         
         updateContent(stats) {
+            console.log('🎨 UI: Updating content with stats:', stats);
             const popup = document.getElementById('linkedin-job-stats-popup');
-            if (!popup) return;
+            if (!popup) {
+                console.log('⚠️ UI: Popup not found');
+                return;
+            }
             
             const content = popup.querySelector('.stats-content');
+            if (!content) {
+                console.log('⚠️ UI: Content element not found');
+                return;
+            }
+            
+            const views = stats.views !== undefined ? stats.views.toLocaleString() : 'N/A';
+            const applies = stats.applies !== undefined ? stats.applies.toLocaleString() : 'N/A';
+            const jobId = stats.jobId || "N/A";
+            
+            console.log('🎨 UI: Setting content - Views:', views, 'Applies:', applies, 'Job ID:', jobId);
+            
             content.innerHTML = `
-                <div class="stat-item"><span>Views:</span><span>${stats.views !== undefined ? stats.views.toLocaleString() : 'N/A'}</span></div>
-                <div class="stat-item"><span>Applicants:</span><span>${stats.applies !== undefined ? stats.applies.toLocaleString() : 'N/A'}</span></div>
-                <div class="job-info">Job ID: ${stats.jobId || "N/A"}</div>
+                <div class="stat-item"><span>Views:</span><span>${views}</span></div>
+                <div class="stat-item"><span>Applicants:</span><span>${applies}</span></div>
+                <div class="job-info">Job ID: ${jobId}</div>
             `;
+            
+            console.log('✅ UI: Content updated successfully');
         },
         
         injectStyles() {
@@ -299,14 +328,6 @@
                     padding: 4px 0;
                 }
                 
-                #linkedin-job-stats-popup .stat-label {
-                    font-weight: 600;
-                }
-                
-                #linkedin-job-stats-popup .stat-value {
-                    font-weight: 600;
-                }
-                
                 #linkedin-job-stats-popup .job-info {
                     font-size: 11px;
                     text-align: center;
@@ -370,6 +391,14 @@
             }
         },
         
+        setWaiting() {
+            const popup = document.getElementById('linkedin-job-stats-popup');
+            if (!popup) return;
+            const content = popup.querySelector('.stats-content');
+            if (!content) return;
+            content.innerHTML = `<div style="padding:1em; text-align:center; font-style:italic;">Select a job to see stats.</div>`;
+        },
+        
         remove() {
             const popup = document.getElementById('linkedin-job-stats-popup');
             if (popup) {
@@ -382,11 +411,19 @@
     };
     
     function updateUI(stats) {
+        console.log('🎨 Updating UI with stats:', stats);
         UI.createPopup();
         UI.updateContent(stats);
+        console.log('✅ UI update completed');
     }
     
-    // Monitor page changes
+    // Debounce function to prevent rapid job changes
+    function debounceJobChange(jobId, callback) {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => callback(jobId), DEBOUNCE_DELAY);
+    }
+    
+    // Monitor page changes with direct data access
     function monitorJobChanges() {
         const observer = new MutationObserver(() => {
             const newJobId = getCurrentJobId();
@@ -394,13 +431,37 @@
                 currentJobId = newJobId;
                 console.log('🆔 New job detected:', currentJobId);
                 
-                // Check if we have stats for this job already
-                if (typeof window.getLinkedInJobStatsById === 'function') {
-                    const stats = window.getLinkedInJobStatsById(currentJobId);
-                    if (stats) {
-                        updateUI(stats);
-                    }
+                // Check cache first
+                const cachedEntry = jobCache.get(currentJobId);
+                if (cachedEntry && (Date.now() - cachedEntry.timestamp < CACHE_TTL)) {
+                    console.log('📋 Using cached stats for job:', currentJobId);
+                    updateUI(cachedEntry.stats);
+                    return;
                 }
+                
+                // Check shared manager for recent stats
+                const managerStats = window.linkedInJobStatsManager.getStatsForJob(currentJobId);
+                if (managerStats) {
+                    console.log('🔄 Found stats in shared manager for job:', currentJobId);
+                    handleJobStats(managerStats);
+                    return;
+                }
+                
+                console.log('⏳ Waiting for job stats for job:', currentJobId);
+                UI.setWaiting();
+                
+                // Debounce job changes to prevent rapid switching issues
+                debounceJobChange(currentJobId, (debouncedJobId) => {
+                    // Check cache again after debounce
+                    const cachedEntry = jobCache.get(debouncedJobId);
+                    if (cachedEntry && (Date.now() - cachedEntry.timestamp < CACHE_TTL)) {
+                        console.log('📋 Using cached stats after debounce for job:', debouncedJobId);
+                        updateUI(cachedEntry.stats);
+                    } else {
+                        console.log('⏳ Still waiting for job stats for job:', debouncedJobId);
+                        UI.setWaiting();
+                    }
+                });
             }
         });
         
@@ -415,6 +476,95 @@
         UI.createPopup();
         monitorJobChanges();
         currentJobId = getCurrentJobId();
-        console.log('✅ LinkedIn Job Stats initialized, current job:', currentJobId);
+        
+        // Check if we have cached stats for current job
+        if (currentJobId) {
+            const cachedEntry = jobCache.get(currentJobId);
+            if (cachedEntry && (Date.now() - cachedEntry.timestamp < CACHE_TTL)) {
+                console.log('📋 Using cached stats for initial job:', currentJobId);
+                updateUI(cachedEntry.stats);
+            } else {
+                // Check shared manager
+                const managerStats = window.linkedInJobStatsManager.getStatsForJob(currentJobId);
+                if (managerStats) {
+                    console.log('🔄 Found stats in shared manager for initial job:', currentJobId);
+                    handleJobStats(managerStats);
+                } else {
+                    UI.setWaiting();
+                }
+            }
+        }
+        
+        console.log('✅ LinkedIn Job Stats initialized with shared manager, current job:', currentJobId);
+        
+        // Add debug functions
+        window.testLinkedInCache = function(jobId) {
+            console.log('🧪 Testing cache for job:', jobId);
+            const cached = jobCache.get(jobId);
+            console.log('Cache has job:', cached);
+            const managerStats = window.linkedInJobStatsManager.getStatsForJob(jobId);
+            console.log('Manager has job:', managerStats);
+        };
+        
+        window.checkSharedManager = function() {
+            console.log('🔍 Checking shared manager...');
+            console.log('Manager stats count:', window.linkedInJobStatsManager.stats.length);
+            console.log('Recent stats:', window.linkedInJobStatsManager.stats.slice(-5));
+        };
+        
+        // Test function to manually add stats to shared manager
+        window.testAddStats = function(jobId, applies, views) {
+            console.log('🧪 Manually adding test stats for job:', jobId);
+            const testStats = {
+                type: 'LINKEDIN_JOB_API_DATA',
+                jobId: jobId,
+                applies: applies,
+                views: views,
+                timestamp: Date.now()
+            };
+            window.linkedInJobStatsManager.addStats(testStats);
+        };
+        
+        // Test function to check if listener is working
+        window.testListener = function() {
+            console.log('🧪 Testing listener...');
+            console.log('Manager listeners count:', window.linkedInJobStatsManager.listeners.length);
+            window.testAddStats('TEST123', 100, 500);
+        };
+        
+        // Test function to force UI update
+        window.testUI = function() {
+            console.log('🧪 Testing UI update...');
+            const testStats = {
+                jobId: 'TEST456',
+                views: 1000,
+                applies: 250,
+                timestamp: Date.now()
+            };
+            updateUI(testStats);
+        };
+        
+        // Manual trigger to check current job stats
+        window.checkCurrentJob = function() {
+            console.log('🧪 Checking current job stats...');
+            console.log('Current job ID:', currentJobId);
+            console.log('Last stats:', lastStats);
+            
+            if (currentJobId) {
+                const stats = window.linkedInJobStatsManager.getStatsForJob(currentJobId);
+                console.log('Stats for current job:', stats);
+                if (stats) {
+                    console.log('🔄 Manually triggering UI update...');
+                    handleJobStats(stats);
+                }
+            }
+        };
     }, 1000);
+    
+    // Clean up timers and state on page unload
+    window.addEventListener('beforeunload', () => {
+        clearTimeout(debounceTimer);
+        currentJobId = null;
+        lastStats = null;
+    });
 })();
